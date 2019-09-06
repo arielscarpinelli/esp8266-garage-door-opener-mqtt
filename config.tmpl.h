@@ -5,11 +5,10 @@
 
 /************************* Gbridge Setup *********************************/
 
-#define AIO_SERVER      "mqtt.gbridge.io"
-#define AIO_SERVERPORT  8883                   
-#define AIO_USERNAME    "gbridge-u123"
-#define AIO_KEY         "SomeMagicPasswordForIOT!"
+#define MQTT_SERVER      "mqtt.gbridge.io"
+#define MQTT_SERVERPORT  8883                   
+#define MQTT_USERNAME    "gbridge-u123"
+#define MQTT_PASS        "SomeMagicPasswordForIOT!"
 
-#define OPEN_CLOSE_SET_FEED "gBridge/u123/d456/openclose/set"
-#define OPEN_CLOSE_FEED "gBridge/u123/d456/openclose"
-
+#define ON_OFF_SET_FEED  "gBridge/u123/d456/onoff/set"
+#define ON_OFF_FEED      "gBridge/u123/d456/onoff"
