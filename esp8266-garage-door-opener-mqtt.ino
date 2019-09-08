@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include "Adafruit_MQTT.h"
-#include "Adafruit_MQTT_Client.h"
+#include <PubSubClient.h>
 
 // Copy config.tmpl.h to config.h and replace with your own values
 #include "config.h"
@@ -13,7 +12,7 @@
 #define INPUT_PIN D2
 
 
-
+void onMqttMessage(char* topic, byte* payload, unsigned int length);
 /************ Global State (you don't need to change this!) ******************/
 
 // Create an ESP8266 WiFiClient class to connect to the MQTT server.
@@ -21,12 +20,7 @@ WiFiClientSecure client;
 BearSSL::X509List certificates(ca_cert[0]);
 
 // Setup the MQTT client class by passing in the WiFi client and MQTT server and login details.
-Adafruit_MQTT_Client mqtt(&client, MQTT_SERVER, MQTT_SERVERPORT, MQTT_USERNAME, MQTT_PASS);
-
-/****************************** Feeds ***************************************/
-
-Adafruit_MQTT_Publish onOffSetFeed = Adafruit_MQTT_Publish(&mqtt, ON_OFF_SET_FEED);
-Adafruit_MQTT_Subscribe onOffFeed = Adafruit_MQTT_Subscribe(&mqtt, ON_OFF_FEED);
+PubSubClient mqtt(MQTT_SERVER, MQTT_SERVERPORT, onMqttMessage, client);
 
 /*************************** Sketch Code ************************************/
 void toggle();
@@ -40,7 +34,7 @@ typedef struct DoorState {
   DoorState* motorStopped;
   void (*receivedRequestToOpen)(void);
   void (*receivedRequestToClose)(void);
-  char valueToNotify;
+  int32_t valueToNotify;
 } DoorState;
 
 DoorState DOOR_CLOSING = {
@@ -83,8 +77,8 @@ char lastNotifiedValue = 0;
 bool shouldPrintCurrentState = true;
 DoorState* currentState = &DOOR_WILL_OPEN_ON_TOGGLE;
 
+void setupWifi();
 void setClock();
-void MQTT_connect();
 void ICACHE_RAM_ATTR motorChanged();
 
 void setup() {
@@ -104,29 +98,7 @@ void setup() {
   
   attachInterrupt(digitalPinToInterrupt(INPUT_PIN), motorChanged, CHANGE);
 
-  // Connect to WiFi access point.
-  Serial.print("Connecting to ");
-  Serial.println(WLAN_SSID);
-
-  WiFi.begin(WLAN_SSID, WLAN_PASS);
-  //WiFi.scanNetworksAsync(prinScanResult);
-
-  int wifiStatus;
-  bool connectingLed = false;
-
-  while ((wifiStatus = WiFi.status()) != WL_CONNECTED) {
-    connectingLed = !connectingLed;
-    digitalWrite(LED_BUILTIN, connectingLed ? HIGH : LOW);
-    delay(500);
-    Serial.print(wifiStatus);
-    Serial.print(" ");
-  }
-
-  Serial.println();
-
-  Serial.println("WiFi connected");
-  digitalWrite(LED_BUILTIN, HIGH);
-  Serial.println("IP address: "); Serial.println(WiFi.localIP());
+  setupWifi();
 
   setClock();
 
@@ -136,59 +108,73 @@ void setup() {
 
   client.setTrustAnchors(&certificates);
 
-  // Setup MQTT subscription for onoff feed.
-  mqtt.subscribe(&onOffFeed);
 }
 
-uint32_t x = 0;
-
-void loop() {
-  // Ensure the connection to the MQTT server is alive (this will make the first
-  // connection and automatically reconnect when disconnected).  See the MQTT_connect
-  // function definition further below.
-  MQTT_connect();
-
-  if (shouldPrintCurrentState) {
-    shouldPrintCurrentState = false;
-    Serial.println(currentState->name);
-  }    
-
-  // this is our 'wait for incoming subscription packets' busy subloop
-  // try to spend your time here
-
-  Adafruit_MQTT_Subscribe *subscription;
-  while ((subscription = mqtt.readSubscription(3000))) {
-    if (subscription == &onOffFeed) {
-      Serial.print(F("Got: "));
-      Serial.println((char *)onOffFeed.lastread);
-      if (strcmp((char *)onOffFeed.lastread, "1") == 0) {
-        currentState->receivedRequestToOpen();
-      }
-      if (strcmp((char *)onOffFeed.lastread, "0") == 0) {
-        currentState->receivedRequestToClose();
-      }
+void reconnect() {
+  // Loop until we're reconnected
+  bool connectingLed = false;
+  while (!mqtt.connected()) {
+    connectingLed = !connectingLed;
+    digitalWrite(LED_BUILTIN, connectingLed ? LOW : HIGH);
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (mqtt.connect("DoorOpener", MQTT_USERNAME, MQTT_PASS)) {
+      Serial.println("connected");
+      mqtt.subscribe(ON_OFF_FEED);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.println(mqtt.state());
+      delay(500);
     }
   }
+  if (connectingLed) {
+    digitalWrite(LED_BUILTIN, HIGH);
+  }  
+}
 
-    
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  Serial.print(F("Got: "));
+  Serial.write(payload, length);
+  Serial.println();
+  if (payload[0] == '1') {
+    currentState->receivedRequestToOpen();
+  }
+  if (payload[0] == '0') {
+    currentState->receivedRequestToClose();
+  }
+}
 
-  char nextValue = currentState->valueToNotify;
-  // Now we can publish stuff!
+void publishIfNeeded() {
+
+  int32_t nextValue = currentState->valueToNotify;
+  
   if (nextValue != lastNotifiedValue) {
-    Serial.print(F("\nSending state val "));
-    Serial.print(nextValue, BIN);
-    Serial.print("...");
-    if (!onOffSetFeed.publish(nextValue)) {
+    char payload[12];
+    ltoa(nextValue, payload, 10);
+
+    Serial.print("Sending ");
+    Serial.println(payload);
+
+    if (!mqtt.publish(ON_OFF_SET_FEED, payload)) {
       Serial.println(F("Failed"));
     } else {
       lastNotifiedValue = nextValue;
       Serial.println(F("OK!"));
     }
   }
+}
 
-  if (!mqtt.ping()) {
-    mqtt.disconnect();
-  }
+void loop() {
+
+  reconnect();
+  mqtt.loop();
+
+  if (shouldPrintCurrentState) {
+    shouldPrintCurrentState = false;
+    Serial.println(currentState->name);
+  }    
+
+  publishIfNeeded();
 }
 
 void toggle() {
@@ -232,34 +218,32 @@ void ICACHE_RAM_ATTR motorChanged() {
   
 }
 
-// Function to connect and reconnect as necessary to the MQTT server.
-// Should be called in the loop function and it will take care if connecting.
-void MQTT_connect() {
-  int8_t ret;
+void setupWifi() {
+    // Connect to WiFi access point.
+  Serial.print("Connecting to ");
+  Serial.println(WLAN_SSID);
 
-  // Stop if already connected.
-  if (mqtt.connected()) {
-    return;
+  WiFi.begin(WLAN_SSID, WLAN_PASS);
+  //WiFi.scanNetworksAsync(prinScanResult);
+
+  int wifiStatus;
+  bool connectingLed = false;
+
+  while ((wifiStatus = WiFi.status()) != WL_CONNECTED) {
+    connectingLed = !connectingLed;
+    digitalWrite(LED_BUILTIN, connectingLed ? HIGH : LOW);
+    delay(500);
+    Serial.print(wifiStatus);
+    Serial.print(" ");
   }
 
-  Serial.print("Connecting to MQTT... ");
+  Serial.println();
 
-  uint8_t retries = 3;
-  while ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
-    Serial.println(mqtt.connectErrorString(ret));
-    char err_buf[256];
-    client.getLastSSLError(err_buf, 256);
-    Serial.println(err_buf);
-    Serial.println("Retrying MQTT connection in 5 seconds...");
-    mqtt.disconnect();
-    delay(5000);  // wait 5 seconds
-    retries--;
-    if (retries == 0) {
-      // basically die and wait for WDT to reset me
-      while (1);
-    }
-  }
-  Serial.println("MQTT Connected!");
+  Serial.println("WiFi connected");
+  digitalWrite(LED_BUILTIN, HIGH);
+  Serial.println("IP address: "); 
+  Serial.println(WiFi.localIP());
+
 }
 
 // Set time via NTP, as required for x.509 validation
