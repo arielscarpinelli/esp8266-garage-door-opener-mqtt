@@ -5,10 +5,12 @@
 
 /************************* Gbridge Setup *********************************/
 
-#define MQTT_SERVER      "mqtt.gbridge.io"
-#define MQTT_SERVERPORT  8883                   
-#define MQTT_USERNAME    "gbridge-u123"
-#define MQTT_PASS        "SomeMagicPasswordForIOT!"
+#define NORA_JWT        "your JWT"
 
-#define ON_OFF_SET_FEED  "gBridge/u123/d456/onoff/set"
-#define ON_OFF_FEED      "gBridge/u123/d456/onoff"
+#define NORA_HOST       "node-red-google-home.herokuapp.com"
+
+#define NORA_PORT       443
+
+#define NORA_URL        "/socket.io/?version=0.0.32&token=" NORA_JWT
+
+#define DEVICE_ID       "MyFancyDevice"
