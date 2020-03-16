@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include <PubSubClient.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
 
 // Copy config.tmpl.h to config.h and replace with your own values
 #include "config.h"
@@ -11,21 +12,9 @@
 #define OUTPUT_PIN D1
 #define INPUT_PIN D2
 
-
-void onMqttMessage(char* topic, byte* payload, unsigned int length);
-/************ Global State (you don't need to change this!) ******************/
-
-// Create an ESP8266 WiFiClient class to connect to the MQTT server.
-WiFiClientSecure client;
-BearSSL::X509List certificates(ca_cert[0]);
-
-// Setup the MQTT client class by passing in the WiFi client and MQTT server and login details.
-PubSubClient mqtt(MQTT_SERVER, MQTT_SERVERPORT, onMqttMessage, client);
-
-/*************************** Sketch Code ************************************/
+// Poorman's state pattern
 void toggle();
 void reverseToggle();
-
 void noop() {};
 
 typedef struct DoorState {
@@ -34,7 +23,7 @@ typedef struct DoorState {
   DoorState* motorStopped;
   void (*receivedRequestToOpen)(void);
   void (*receivedRequestToClose)(void);
-  int32_t valueToNotify;
+  bool valueToNotify;
 } DoorState;
 
 DoorState DOOR_CLOSING = {
@@ -43,7 +32,7 @@ DoorState DOOR_CLOSING = {
   .motorStopped = &DOOR_CLOSING, // redefined below
   .receivedRequestToOpen = reverseToggle,
   .receivedRequestToClose = noop,
-  .valueToNotify = 1
+  .valueToNotify = true
 };
 
 DoorState DOOR_WILL_CLOSE_ON_TOGGLE = {
@@ -52,7 +41,7 @@ DoorState DOOR_WILL_CLOSE_ON_TOGGLE = {
   .motorStopped = &DOOR_WILL_CLOSE_ON_TOGGLE,
   .receivedRequestToOpen = noop,
   .receivedRequestToClose = toggle,
-  .valueToNotify = 1
+  .valueToNotify = true
 };
 
 DoorState DOOR_OPENING = {
@@ -61,7 +50,7 @@ DoorState DOOR_OPENING = {
   .motorStopped = &DOOR_WILL_CLOSE_ON_TOGGLE,
   .receivedRequestToOpen = noop,
   .receivedRequestToClose = reverseToggle,
-  .valueToNotify = 1
+  .valueToNotify = true
 };
 
 DoorState DOOR_WILL_OPEN_ON_TOGGLE = {
@@ -70,15 +59,22 @@ DoorState DOOR_WILL_OPEN_ON_TOGGLE = {
   .motorStopped = &DOOR_WILL_OPEN_ON_TOGGLE,
   .receivedRequestToOpen = toggle,
   .receivedRequestToClose = noop,
-  .valueToNotify = 0
+  .valueToNotify = false
 };
 
-char lastNotifiedValue = 0;
-bool shouldPrintCurrentState = true;
 DoorState* currentState = &DOOR_WILL_OPEN_ON_TOGGLE;
 
-void setupWifi();
-void setClock();
+WebSocketsClient webSocket;
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length);
+void publishState();
+
+bool connected = false;
+bool justConnected = false;
+bool connectingLed = false;
+
+bool lastNotifiedValue = false;
+
 void ICACHE_RAM_ATTR motorChanged();
 
 void setup() {
@@ -95,86 +91,28 @@ void setup() {
   pinMode(OUTPUT_PIN, OUTPUT);
   pinMode(INPUT_PIN, INPUT);
 
-  
   attachInterrupt(digitalPinToInterrupt(INPUT_PIN), motorChanged, CHANGE);
 
-  setupWifi();
+  WiFi.begin(WLAN_SSID, WLAN_PASS);
 
-  setClock();
+  // Set time via NTP, as required for x.509 validation
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
-  for (int i = 1; i < CA_CERT_COUNT; i++) {
-    certificates.append(ca_cert[i]);
-  }
+  webSocket.beginSslWithCA("iotmaster.dev", 443, "/api/ws?deviceid=" DEVICE_ID "&apikey=" API_KEY, ca_cert[0]);
+  webSocket.onEvent(webSocketEvent);
 
-  client.setTrustAnchors(&certificates);
-
-}
-
-void reconnect() {
-  // Loop until we're reconnected
-  bool connectingLed = false;
-  while (!mqtt.connected()) {
-    connectingLed = !connectingLed;
-    digitalWrite(LED_BUILTIN, connectingLed ? LOW : HIGH);
-    Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    if (mqtt.connect("DoorOpener", MQTT_USERNAME, MQTT_PASS)) {
-      Serial.println("connected");
-      mqtt.subscribe(ON_OFF_FEED);
-    } else {
-      Serial.print("failed, rc=");
-      Serial.println(mqtt.state());
-      delay(500);
-    }
-  }
-  if (connectingLed) {
-    digitalWrite(LED_BUILTIN, HIGH);
-  }  
-}
-
-void onMqttMessage(char* topic, byte* payload, unsigned int length) {
-  Serial.print(F("Got: "));
-  Serial.write(payload, length);
-  Serial.println();
-  if (payload[0] == '1') {
-    currentState->receivedRequestToOpen();
-  }
-  if (payload[0] == '0') {
-    currentState->receivedRequestToClose();
-  }
-}
-
-void publishIfNeeded() {
-
-  int32_t nextValue = currentState->valueToNotify;
-  
-  if (nextValue != lastNotifiedValue) {
-    char payload[12];
-    ltoa(nextValue, payload, 10);
-
-    Serial.print("Sending ");
-    Serial.println(payload);
-
-    if (!mqtt.publish(ON_OFF_SET_FEED, payload)) {
-      Serial.println(F("Failed"));
-    } else {
-      lastNotifiedValue = nextValue;
-      Serial.println(F("OK!"));
-    }
-  }
 }
 
 void loop() {
 
-  reconnect();
-  mqtt.loop();
+  updateConnectingLed();
+  webSocket.loop();
 
-  if (shouldPrintCurrentState) {
-    shouldPrintCurrentState = false;
+  if (currentState->valueToNotify != lastNotifiedValue) {
+    publishState();
     Serial.println(currentState->name);
-  }    
+  }
 
-  publishIfNeeded();
 }
 
 void toggle() {
@@ -194,14 +132,6 @@ void reverseToggle() {
   toggle();
 }
 
-void updateCurrentState(struct DoorState *nextState) {
-  Serial.println(nextState->name);
-  if(nextState != currentState) {
-    shouldPrintCurrentState = true;
-    currentState = nextState;
-  }
-}
-
 void ICACHE_RAM_ATTR motorChanged() {
   static unsigned long last_interrupt_time = 0;
   unsigned long interrupt_time = millis();
@@ -209,61 +139,127 @@ void ICACHE_RAM_ATTR motorChanged() {
     bool value = digitalRead(INPUT_PIN);
     digitalWrite(SECONDARY_LED, value);
     if (value == LOW) { // input is inverted
-      updateCurrentState(currentState->motorStarted);
+      currentState = currentState->motorStarted;
     } else {
-      updateCurrentState(currentState->motorStopped);  
+      currentState = currentState->motorStopped;
     }
   }
   last_interrupt_time = interrupt_time;
   
 }
 
-void setupWifi() {
-    // Connect to WiFi access point.
-  Serial.print("Connecting to ");
-  Serial.println(WLAN_SSID);
+void updateConnectingLed() {
 
-  WiFi.begin(WLAN_SSID, WLAN_PASS);
-  //WiFi.scanNetworksAsync(prinScanResult);
-
-  int wifiStatus;
-  bool connectingLed = false;
-
-  while ((wifiStatus = WiFi.status()) != WL_CONNECTED) {
-    connectingLed = !connectingLed;
-    digitalWrite(LED_BUILTIN, connectingLed ? HIGH : LOW);
-    delay(500);
-    Serial.print(wifiStatus);
-    Serial.print(" ");
+  static unsigned long lastLoopMillis = 0; 
+  
+  if (!connected) {
+    unsigned long currentTimeMillis = millis();
+    if (currentTimeMillis > (lastLoopMillis + 500)) {
+      lastLoopMillis = currentTimeMillis;
+      connectingLed = !connectingLed;
+      digitalWrite(LED_BUILTIN, connectingLed ? LOW : HIGH);
+    }
   }
 
-  Serial.println();
+  if (justConnected) {
+    connectingLed = false;
+    justConnected = false;
+    digitalWrite(LED_BUILTIN, HIGH);
+  }
+      
+}
 
-  Serial.println("WiFi connected");
-  digitalWrite(LED_BUILTIN, HIGH);
-  Serial.println("IP address: "); 
-  Serial.println(WiFi.localIP());
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+
+  switch(type) {
+
+    case WStype_DISCONNECTED:
+      Serial.println("[WSc] Disconnected!");
+      connected = false;
+      break;
+
+    case WStype_CONNECTED:
+      Serial.println("[WSc] Connected to url:");
+      Serial.write(payload, length);
+      connected = true;
+      justConnected = true;
+      publishState();   
+      break;
+
+    case WStype_TEXT:
+      Serial.println("[WSc] got text:");
+      Serial.write(payload, length);
+
+      const size_t capacity = JSON_OBJECT_SIZE(20);
+      DynamicJsonDocument doc(capacity);
+
+      // Deserialize the JSON document
+      DeserializationError error = deserializeJson(doc, payload, length);
+
+      // Test if parsing succeeds.
+      if (error) {
+          Serial.print(F("deserializeJson() failed: "));
+          Serial.println(error.c_str());
+          return;
+      }
+
+      if (doc["action"] == "update") {
+          const char *sequence = doc["sequence"];
+          JsonObject params = doc["params"];
+          
+          if (params.containsKey("on")) {
+            if (params["on"]) {
+              currentState->receivedRequestToOpen();
+            } else {
+              currentState->receivedRequestToClose();
+            }
+            sendRecipt(sequence);
+          }
+          
+      }
+      
+      break;
+
+  }
 
 }
 
-// Set time via NTP, as required for x.509 validation
-void setClock() {
-  configTime(3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+void publishState() {
 
-  Serial.print("Waiting for NTP time sync: ");
-  time_t now = time(nullptr);
-  while (now < 8 * 3600 * 2) {
-    delay(500);
-    Serial.print(".");
-    now = time(nullptr);
+  bool nextValue = currentState->valueToNotify;
+
+  const size_t capacity = JSON_OBJECT_SIZE(20);
+  DynamicJsonDocument doc(capacity);
+
+  doc["action"] = "update";
+  doc["deviceid"] = DEVICE_ID;
+  doc["apikey"] = API_KEY;
+  JsonObject params  = doc.createNestedObject("params");
+  params["on"] = nextValue;
+
+  String json;
+  serializeJson(doc, json);  
+  
+  if(webSocket.sendTXT(json)) {
+    lastNotifiedValue = nextValue;
   }
-  Serial.println("");
-  struct tm timeinfo;
-  gmtime_r(&now, &timeinfo);
-  Serial.print("Current time: ");
-  Serial.print(asctime(&timeinfo));
+  
 }
 
+void sendRecipt(const char *sequence) {
+
+    const size_t capacity = JSON_OBJECT_SIZE(20);
+    DynamicJsonDocument doc(capacity);
+
+    doc["error"] = 0;
+    doc["sequence"] = sequence;
+
+    String json;
+    serializeJson(doc, json);  
+    
+    webSocket.sendTXT(json);
+  
+}
 /*
   void prinScanResult(int networksFound)
   {
