@@ -2,7 +2,7 @@
 
 The code here works with an NodeMCU and a garage opener that has connectors for an external push button and a light that should be turned on while the door motor is running.
 
-To connect with Google Home, I'm using gbridge.io
+To connect with Google Home, I'm using iotmaster.dev
 
 
 # Interface
